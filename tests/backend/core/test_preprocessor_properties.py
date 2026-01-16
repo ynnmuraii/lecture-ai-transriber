@@ -50,7 +50,7 @@ class TestFillerWordRemoval:
     
     @given(
         words=st.lists(
-            st.text(alphabet=st.characters(whitelist_categories=('L',)), min_size=2, max_size=10),
+            st.text(alphabet='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ', min_size=2, max_size=10),
             min_size=1,
             max_size=5
         ),

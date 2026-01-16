@@ -62,6 +62,8 @@ output/
 htmlcov/
 .tox/
 .hypothesis/
+test_output/
+
 
 # Documentation
 docs/_build/
