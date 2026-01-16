@@ -61,6 +61,7 @@ output/
 .coverage
 htmlcov/
 .tox/
+.hypothesis/
 
 # Documentation
 docs/_build/
