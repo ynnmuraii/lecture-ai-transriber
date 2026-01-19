@@ -25,6 +25,7 @@ from backend.core.processing.transcriber import Transcriber, TranscriberConfig
 from backend.core.processing.preprocessor import Preprocessor
 from backend.core.processing.segment_merger import SegmentMerger
 from backend.core.processing.vad_processor import VADProcessor
+from backend.core.processing.hallucination_filter import HallucinationFilter, HallucinationFilterConfig
 from backend.infrastructure.config_manager import ConfigurationManager
 from backend.infrastructure.device_manager import DeviceManager
 
@@ -38,6 +39,7 @@ class ProcessingStage(str, Enum):
     EXTRACTING_AUDIO = "extracting_audio"
     DETECTING_SPEECH = "detecting_speech"
     TRANSCRIBING = "transcribing"
+    FILTERING_HALLUCINATIONS = "filtering_hallucinations"
     PREPROCESSING = "preprocessing"
     MERGING_SEGMENTS = "merging_segments"
     FORMATTING_FORMULAS = "formatting_formulas"
@@ -64,7 +66,7 @@ class ProcessingProgress:
     stage: ProcessingStage = ProcessingStage.INITIALIZING
     progress_percent: float = 0.0
     current_step: str = ""
-    total_steps: int = 7
+    total_steps: int = 8
     completed_steps: int = 0
     start_time: float = field(default_factory=time.time)
     stage_start_time: float = field(default_factory=time.time)
@@ -83,6 +85,7 @@ class ProcessingProgress:
             ProcessingStage.EXTRACTING_AUDIO,
             ProcessingStage.DETECTING_SPEECH,
             ProcessingStage.TRANSCRIBING,
+            ProcessingStage.FILTERING_HALLUCINATIONS,
             ProcessingStage.PREPROCESSING,
             ProcessingStage.MERGING_SEGMENTS,
             ProcessingStage.GENERATING_OUTPUT,
@@ -138,6 +141,7 @@ class PipelineOrchestrator:
         self.audio_extractor: Optional[AudioExtractor] = None
         self.vad_processor: Optional[VADProcessor] = None
         self.transcriber: Optional[Transcriber] = None
+        self.hallucination_filter: Optional[HallucinationFilter] = None
         self.preprocessor: Optional[Preprocessor] = None
         self.segment_merger: Optional[SegmentMerger] = None
         self.device_manager: Optional[DeviceManager] = None
@@ -147,6 +151,7 @@ class PipelineOrchestrator:
         self.current_audio_path: Optional[str] = None
         self.speech_segments: List = []
         self.intermediate_files: List[str] = []
+        self.filtered_segments_log: List[Dict[str, any]] = []
         
         logger.info("Pipeline Orchestrator initialized")
     
@@ -190,6 +195,19 @@ class PipelineOrchestrator:
             config=transcriber_config,
             device_manager=self.device_manager
         )
+        
+        # Initialize hallucination filter
+        hallucination_config_dict = getattr(self.config, 'hallucination_filter', {})
+        hallucination_config = HallucinationFilterConfig(
+            compression_ratio_threshold=hallucination_config_dict.get('compression_ratio_threshold', 1.8),
+            logprob_threshold=hallucination_config_dict.get('logprob_threshold', -0.8),
+            enable_blacklist_filter=hallucination_config_dict.get('enable_blacklist_filter', True),
+            enable_pattern_filter=hallucination_config_dict.get('enable_pattern_filter', True),
+            enable_compression_filter=hallucination_config_dict.get('enable_compression_filter', True),
+            enable_logprob_filter=hallucination_config_dict.get('enable_logprob_filter', True),
+            custom_blacklist=hallucination_config_dict.get('custom_blacklist', [])
+        )
+        self.hallucination_filter = HallucinationFilter(config=hallucination_config)
         
         # Initialize preprocessor
         self.preprocessor = Preprocessor(
@@ -333,12 +351,20 @@ class PipelineOrchestrator:
             segments = transcription_result.segments
             logger.info(f"Transcribed {len(segments)} segments")
             
+            # Stage 4.5: Filter hallucinations
+            self._update_progress(
+                ProcessingStage.FILTERING_HALLUCINATIONS,
+                "Filtering Whisper hallucinations"
+            )
+            filtered_segments = self._filter_hallucinations(segments, transcription_result)
+            logger.info(f"Filtered to {len(filtered_segments)} segments (removed {len(segments) - len(filtered_segments)} hallucinations)")
+            
             # Stage 5: Preprocess
             self._update_progress(
                 ProcessingStage.PREPROCESSING,
                 f"Cleaning text (intensity: {options.cleaning_intensity})"
             )
-            cleaned_segments = self._preprocess_segments(segments)
+            cleaned_segments = self._preprocess_segments(filtered_segments)
             logger.info(f"Preprocessed {len(cleaned_segments)} segments")
             
             # Stage 6: Merge segments
@@ -594,6 +620,88 @@ class PipelineOrchestrator:
             logger.info("Falling back to full audio transcription")
             return self.transcriber.transcribe(audio_path, language=language)
     
+    def _filter_hallucinations(
+        self,
+        segments: List[TranscriptionSegment],
+        transcription_result
+    ) -> List[TranscriptionSegment]:
+        """
+        Filter hallucinations from transcription segments.
+        
+        Args:
+            segments: List of transcription segments
+            transcription_result: Full transcription result with metadata
+            
+        Returns:
+            Filtered list of segments
+        """
+        if not self.hallucination_filter:
+            logger.warning("Hallucination filter not initialized, skipping filtering")
+            return segments
+        
+        try:
+            # Extract compression ratios and logprobs if available
+            compression_ratios = None
+            logprobs = None
+            
+            # Check if transcription result has these attributes
+            if hasattr(transcription_result, 'compression_ratios'):
+                compression_ratios = transcription_result.compression_ratios
+            if hasattr(transcription_result, 'logprobs'):
+                logprobs = transcription_result.logprobs
+            
+            # Store original segments for logging
+            original_count = len(segments)
+            
+            # Filter segments
+            filtered_segments = self.hallucination_filter.filter_segments(
+                segments,
+                compression_ratios=compression_ratios,
+                logprobs=logprobs
+            )
+            
+            # Log filtered segments for debugging
+            filtered_count = original_count - len(filtered_segments)
+            if filtered_count > 0:
+                # Store information about filtered segments
+                for i, segment in enumerate(segments):
+                    if segment not in filtered_segments:
+                        filtered_info = {
+                            'index': i,
+                            'text': segment.text,
+                            'start_time': segment.start_time,
+                            'end_time': segment.end_time,
+                            'duration': segment.end_time - segment.start_time
+                        }
+                        self.filtered_segments_log.append(filtered_info)
+                        
+                        # Log each filtered segment for debugging
+                        logger.debug(
+                            f"Filtered segment #{i}: [{segment.start_time:.2f}s-{segment.end_time:.2f}s] "
+                            f"'{segment.text[:100]}...'"
+                        )
+                
+                logger.info(f"Filtered {filtered_count} hallucinated segments")
+                
+                # Get and log statistics
+                stats = self.hallucination_filter.get_filter_statistics(segments, filtered_segments)
+                logger.info(
+                    f"Filtering stats: {stats['removal_percentage']:.1f}% segments removed, "
+                    f"{stats['removed_duration_seconds']:.1f}s of audio filtered"
+                )
+                
+                # Write detailed log to file if debug mode is enabled
+                if self.config.debug_mode:
+                    self._write_filtered_segments_log()
+            
+            return filtered_segments
+            
+        except Exception as e:
+            logger.error(f"Hallucination filtering error: {e}")
+            # Filtering errors are recoverable - return original segments
+            self.progress.warnings.append(f"Hallucination filtering failed: {str(e)}")
+            return segments
+    
     def _preprocess_segments(self, segments: List[TranscriptionSegment]) -> List[TranscriptionSegment]:
         """Preprocess transcription segments."""
         if not self.preprocessor:
@@ -757,6 +865,38 @@ class PipelineOrchestrator:
             total_processing_time=time.time() - start_time,
             warnings=self.progress.warnings
         )
+    
+    def _write_filtered_segments_log(self):
+        """Write filtered segments to a debug log file."""
+        if not self.filtered_segments_log:
+            return
+        
+        try:
+            import json
+            from pathlib import Path
+            
+            # Create logs directory if it doesn't exist
+            log_dir = Path(self.config.output_directory) / "debug_logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Generate log filename
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            video_name = Path(self.current_video_path).stem if self.current_video_path else "unknown"
+            log_file = log_dir / f"filtered_segments_{video_name}_{timestamp}.json"
+            
+            # Write log
+            with open(log_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'video_path': self.current_video_path,
+                    'timestamp': timestamp,
+                    'total_filtered': len(self.filtered_segments_log),
+                    'filtered_segments': self.filtered_segments_log
+                }, f, indent=2, ensure_ascii=False)
+            
+            logger.info(f"Filtered segments log written to: {log_file}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to write filtered segments log: {e}")
     
     def _cleanup_temp_files(self):
         """Clean up temporary files."""

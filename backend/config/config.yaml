@@ -98,6 +98,31 @@ vad:
   # Sample rate for VAD processing (16000 Hz is optimal for Silero VAD)
   sample_rate: 16000
 
+# Hallucination Filter Settings
+hallucination_filter:
+  # Compression ratio threshold (higher = more repetitive)
+  # Segments with compression ratio above this will be filtered
+  # Default: 1.8 (Whisper default is 2.4, we use more aggressive filtering)
+  compression_ratio_threshold: 1.8
+  
+  # Log probability threshold (lower = less confident)
+  # Segments with average log probability below this will be filtered
+  # Default: -0.8 (Whisper default is -1.0, we use more aggressive filtering)
+  logprob_threshold: -0.8
+  
+  # Enable/disable specific filter types
+  enable_blacklist_filter: true    # Filter known hallucination phrases
+  enable_pattern_filter: true      # Filter regex patterns (URLs, social media, etc.)
+  enable_compression_filter: true  # Filter high compression ratio segments
+  enable_logprob_filter: true      # Filter low confidence segments
+  
+  # Custom blacklist phrases (in addition to built-in defaults)
+  # Add domain-specific phrases that should be filtered
+  custom_blacklist:
+    # Add your custom phrases here
+    # - "custom phrase 1"
+    # - "custom phrase 2"
+
 # Text Preprocessing Settings
 preprocessing:
   filler_words:
